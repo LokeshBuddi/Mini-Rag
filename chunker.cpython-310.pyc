@@ -1,0 +1,86 @@
+"""
+vector_store.py
+---------------
+VectorStore — wraps sentence-transformers + FAISS into a single
+build / save / load / search interface.
+"""
+
+import json
+import numpy as np
+import faiss
+from pathlib import Path
+from typing import List, Tuple
+from sentence_transformers import SentenceTransformer
+from core.chunker import Chunk
+
+
+MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+INDEX_FILE = "index.bin"
+META_FILE  = "meta.json"
+
+
+class VectorStore:
+    def __init__(self, store_dir: str = "vector_store"):
+        self.store_dir = Path(store_dir)
+        self._model: SentenceTransformer | None = None
+        self._index: faiss.Index | None = None
+        self._meta: List[dict] = []
+
+    # ── Model ──────────────────────────────────────────────────────────────────
+    @property
+    def model(self) -> SentenceTransformer:
+        if self._model is None:
+            print(f"  Loading model: {MODEL_NAME}")
+            self._model = SentenceTransformer(MODEL_NAME)
+        return self._model
+
+    # ── Build ──────────────────────────────────────────────────────────────────
+    def build(self, chunks: List[Chunk]) -> None:
+        texts = [c.text for c in chunks]
+        print(f"  Embedding {len(texts)} chunks …")
+        embs = self.model.encode(
+            texts, batch_size=64,
+            show_progress_bar=len(texts) > 20,
+            convert_to_numpy=True,
+            normalize_embeddings=True
+        ).astype(np.float32)
+
+        self._index = faiss.IndexFlatIP(embs.shape[1])
+        self._index.add(embs)
+        self._meta = [{"id": c.id, "source": c.source, "text": c.text} for c in chunks]
+
+        self._save()
+        print(f"  Index built — {self._index.ntotal} vectors (dim={self._index.d})\n")
+
+    # ── Persist ────────────────────────────────────────────────────────────────
+    def _save(self) -> None:
+        self.store_dir.mkdir(parents=True, exist_ok=True)
+        faiss.write_index(self._index, str(self.store_dir / INDEX_FILE))
+        (self.store_dir / META_FILE).write_text(
+            json.dumps(self._meta, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    def load(self) -> None:
+        self._index = faiss.read_index(str(self.store_dir / INDEX_FILE))
+        self._meta = json.loads((self.store_dir / META_FILE).read_text(encoding="utf-8"))
+        print(f"  Index loaded — {self._index.ntotal} vectors\n")
+
+    def exists(self) -> bool:
+        return (self.store_dir / INDEX_FILE).exists()
+
+    # ── Search ─────────────────────────────────────────────────────────────────
+    def search(self, query: str, top_k: int = 3) -> List[dict]:
+        q_emb = self.model.encode(
+            [query], convert_to_numpy=True, normalize_embeddings=True
+        ).astype(np.float32)
+
+        scores, indices = self._index.search(q_emb, top_k)
+        results = []
+        for rank, (idx, score) in enumerate(zip(indices[0], scores[0]), start=1):
+            if idx == -1:
+                continue
+            item = dict(self._meta[idx])
+            item["rank"] = rank
+            item["score"] = float(score)
+            results.append(item)
+        return results
